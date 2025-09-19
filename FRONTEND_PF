@@ -1,0 +1,240 @@
+import streamlit as st
+import pandas as pd
+import requests
+import plotly.express as px
+import plotly.graph_objects as go
+import json
+from datetime import date
+
+# --- Constants ---
+BACKEND_URL = "http://127.0.0.1:8000"
+
+# --- Session State Management ---
+if 'user_id' not in st.session_state:
+    st.session_state['user_id'] = None
+if 'logged_in' not in st.session_state:
+    st.session_state['logged_in'] = False
+
+# --- Helper Functions ---
+def get_user_assets(user_id):
+    try:
+        response = requests.get(f"{BACKEND_URL}/portfolio/{user_id}")
+        if response.status_code == 200:
+            return response.json()['holdings']
+    except requests.exceptions.ConnectionError:
+        st.error("Could not connect to the backend. Please ensure the backend server is running.")
+    return []
+
+def get_user_accounts(user_id):
+    try:
+        response = requests.get(f"{BACKEND_URL}/accounts/{user_id}")
+        if response.status_code == 200:
+            return response.json()
+    except requests.exceptions.ConnectionError:
+        st.error("Could not connect to the backend.")
+    return []
+
+# --- UI Components ---
+def login_page():
+    st.title("Login or Register")
+    login_tab, register_tab = st.tabs(["Login", "Register"])
+    
+    with login_tab:
+        username = st.text_input("Username", key="login_username")
+        password = st.text_input("Password", type="password", key="login_password")
+        if st.button("Login"):
+            try:
+                response = requests.post(f"{BACKEND_URL}/login", json={"username": username, "password": password})
+                if response.status_code == 200:
+                    st.session_state['user_id'] = response.json()['user_id']
+                    st.session_state['logged_in'] = True
+                    st.success("Login successful!")
+                    st.rerun()
+                else:
+                    st.error("Invalid username or password.")
+            except requests.exceptions.ConnectionError:
+                st.error("Could not connect to the backend. Please ensure the backend server is running.")
+
+    with register_tab:
+        username = st.text_input("New Username", key="reg_username")
+        password = st.text_input("New Password", type="password", key="reg_password")
+        if st.button("Register"):
+            try:
+                response = requests.post(f"{BACKEND_URL}/register", json={"username": username, "password": password})
+                if response.status_code == 200:
+                    st.success("Registration successful! You can now log in.")
+                else:
+                    st.error("Username already exists.")
+            except requests.exceptions.ConnectionError:
+                st.error("Could not connect to the backend. Please ensure the backend server is running.")
+
+def main_app():
+    st.sidebar.title("Navigation")
+    if st.sidebar.button("Logout"):
+        st.session_state['user_id'] = None
+        st.session_state['logged_in'] = False
+        st.rerun()
+
+    st.title("Financial Portfolio Tracker")
+    tabs = st.tabs(["Dashboard", "Manage Assets", "Transactions", "Reports"])
+
+    # --- Dashboard Tab ---
+    with tabs[0]:
+        st.header("Portfolio Overview")
+        user_id = st.session_state['user_id']
+        try:
+            summary_response = requests.get(f"{BACKEND_URL}/portfolio/{user_id}")
+            
+            if summary_response.status_code == 200:
+                summary_data = summary_response.json()
+                
+                # Metrics
+                col1, col2 = st.columns(2)
+                col1.metric("Total Portfolio Value", f"${summary_data['total_value']:.2f}")
+                
+                gain_loss = summary_data['total_gain_loss']
+                col2.metric("Total Gain/Loss", f"${gain_loss:.2f}")
+                
+                st.markdown("---")
+                
+                # Allocation Chart
+                st.subheader("Asset Allocation")
+                df_allocation = pd.DataFrame(summary_data['holdings'])
+                if not df_allocation.empty:
+                    fig_pie = px.pie(
+                        df_allocation,
+                        values='current_value',
+                        names='asset_class',
+                        title='Portfolio Breakdown by Asset Class'
+                    )
+                    st.plotly_chart(fig_pie)
+                else:
+                    st.info("Add some assets to see your portfolio breakdown.")
+                    
+                st.markdown("---")
+                
+                # Individual Holdings
+                st.subheader("Individual Holdings")
+                if not df_allocation.empty:
+                    st.dataframe(df_allocation[['ticker', 'shares', 'current_value', 'cost_basis', 'gain_loss']])
+                else:
+                    st.info("You have no holdings yet. Go to 'Manage Assets' to add some.")
+
+        except requests.exceptions.ConnectionError:
+            st.error("Could not connect to the backend. Please ensure the backend server is running.")
+            
+    # --- Manage Assets Tab ---
+    with tabs[1]:
+        st.header("Manage Your Assets")
+        st.subheader("Create a New Asset")
+        
+        user_accounts = get_user_accounts(st.session_state['user_id'])
+        if not user_accounts:
+            st.warning("Please create an account first.")
+            st.info("Go to 'Manage Accounts' below to get started.")
+        else:
+            with st.form("new_asset_form"):
+                account_map = {acc['account_name']: acc['account_id'] for acc in user_accounts}
+                selected_account_name = st.selectbox("Select Account", list(account_map.keys()))
+                ticker = st.text_input("Ticker Symbol (e.g., MSFT, BTC)")
+                asset_class = st.selectbox("Asset Class", ["Equity", "Fixed Income", "Cryptocurrency", "Other"])
+                
+                if st.form_submit_button("Create Asset"):
+                    asset_data = {
+                        "account_id": account_map[selected_account_name],
+                        "ticker_symbol": ticker.upper(),
+                        "asset_class": asset_class,
+                    }
+                    response = requests.post(f"{BACKEND_URL}/assets", json=asset_data)
+                    if response.status_code == 200:
+                        st.success("Asset created successfully! Now go to 'Transactions' to log a purchase.")
+                    elif response.status_code == 400:
+                        st.error("Asset already exists in this account.")
+                    else:
+                        st.error("Failed to create asset.")
+
+        st.markdown("---")
+        st.subheader("Manage Accounts")
+        with st.form("new_account_form"):
+            account_name = st.text_input("New Account Name (e.g., Brokerage, Roth IRA)")
+            if st.form_submit_button("Create Account"):
+                response = requests.post(f"{BACKEND_URL}/accounts", json={"account_name": account_name, "user_id": st.session_state['user_id']})
+                if response.status_code == 200:
+                    st.success("Account created successfully!")
+                else:
+                    st.error("Failed to create account.")
+
+        st.markdown("---")
+        st.subheader("Your Existing Assets")
+        user_assets = get_user_assets(st.session_state['user_id'])
+        if user_assets:
+            df_assets = pd.DataFrame(user_assets)
+            st.dataframe(df_assets[['ticker', 'asset_class']])
+            
+            st.warning("Use the form below to delete an asset and all its transactions.")
+            with st.form("delete_asset_form"):
+                asset_options = {f"{a['ticker']} ({a['asset_class']})": a['asset_id'] for a in user_assets}
+                asset_to_delete = st.selectbox("Select Asset to Delete", list(asset_options.keys()))
+                if st.form_submit_button("Delete Asset"):
+                    asset_id = asset_options[asset_to_delete]
+                    response = requests.delete(f"{BACKEND_URL}/assets/{asset_id}")
+                    if response.status_code == 200:
+                        st.success(f"Asset '{asset_to_delete}' and all its transactions have been deleted.")
+                        st.rerun()
+                    else:
+                        st.error("Failed to delete asset.")
+        else:
+            st.info("No assets created yet.")
+
+    # --- Transactions Tab ---
+    with tabs[2]:
+        st.header("Log Transactions")
+        user_assets = get_user_assets(st.session_state['user_id'])
+        if not user_assets:
+            st.warning("Please create an asset first on the 'Manage Assets' tab.")
+        else:
+            with st.form("transaction_form"):
+                asset_map = {f"{a['ticker']} ({a['asset_class']})": a['asset_id'] for a in user_assets}
+                selected_asset_name = st.selectbox("Select Asset", list(asset_map.keys()))
+                asset_id = asset_map[selected_asset_name]
+
+                transaction_type = st.selectbox("Transaction Type", ["Buy", "Sell", "Dividend"])
+                transaction_date = st.date_input("Transaction Date", value=date.today())
+
+                if transaction_type == "Dividend":
+                    amount = st.number_input("Dividend Amount ($)", min_value=0.01)
+                    shares = None
+                    price_per_share = None
+                else:
+                    shares = st.number_input(f"Number of Shares", min_value=0.01)
+                    price_per_share = st.number_input("Price per Share ($)", min_value=0.01)
+                    amount = shares * price_per_share
+                
+                st.write(f"**Total Transaction Amount:** ${amount:.2f}")
+
+                if st.form_submit_button("Log Transaction"):
+                    transaction_data = {
+                        "asset_id": asset_id,
+                        "transaction_type": transaction_type,
+                        "transaction_date": str(transaction_date),
+                        "shares": shares,
+                        "price_per_share": price_per_share,
+                        "amount": amount
+                    }
+                    response = requests.post(f"{BACKEND_URL}/transactions", json=transaction_data)
+                    if response.status_code == 200:
+                        st.success("Transaction logged successfully!")
+                    else:
+                        st.error(f"Failed to log transaction: {response.json()['detail']}")
+
+    # --- Reports Tab ---
+    with tabs[3]:
+        st.header("Generate Reports")
+        st.info("This feature is not yet implemented. It would display historical performance over time.")
+
+
+# --- Main App Logic ---
+if st.session_state['logged_in']:
+    main_app()
+else:
+    login_page()
