@@ -1,0 +1,225 @@
+import os
+import uuid
+import psycopg2
+from fastapi import FastAPI, HTTPException, Body
+from pydantic import BaseModel
+import bcrypt
+from datetime import date
+import requests
+import random
+
+# --- Database Connection ---
+DATABASE_URL = "postgresql://postgres:5432@localhost:5432/FinancialTracker"
+
+def get_db_connection():
+    return psycopg2.connect(DATABASE_URL)
+
+# --- FastAPI App ---
+app = FastAPI()
+
+# --- Pydantic Models for Data Validation ---
+class User(BaseModel):
+    username: str
+    password: str
+
+class Account(BaseModel):
+    account_name: str
+
+class Asset(BaseModel):
+    account_id: str
+    ticker_symbol: str
+    asset_class: str
+
+class Transaction(BaseModel):
+    asset_id: str
+    transaction_type: str
+    transaction_date: str
+    shares: float = None
+    price_per_share: float = None
+    amount: float
+
+# --- Mock API for Real-time Data ---
+def get_current_price_mock(ticker):
+    """Simulates fetching real-time price from a financial API."""
+    return random.uniform(50, 2000)
+
+# --- User Endpoints ---
+@app.post("/register")
+async def register(user: User):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    hashed_password = bcrypt.hashpw(user.password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+    try:
+        cursor.execute("INSERT INTO users (username, password_hash) VALUES (%s, %s) RETURNING user_id",
+                       (user.username, hashed_password))
+        user_id = cursor.fetchone()[0]
+        conn.commit()
+        return {"message": "User registered successfully", "user_id": user_id}
+    except psycopg2.IntegrityError:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail="Username already exists")
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.post("/login")
+async def login(user: User):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id, password_hash FROM users WHERE username = %s", (user.username,))
+    user_data = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    if user_data and bcrypt.checkpw(user.password.encode('utf-8'), user_data[1].encode('utf-8')):
+        return {"message": "Login successful", "user_id": user_data[0]}
+    raise HTTPException(status_code=401, detail="Invalid username or password")
+
+# --- Account & Asset Endpoints ---
+@app.post("/accounts")
+async def create_account(account: Account, user_id: str = Body(...)):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO accounts (user_id, account_name) VALUES (%s, %s) RETURNING account_id",
+                   (user_id, account.account_name))
+    account_id = cursor.fetchone()[0]
+    conn.commit()
+    cursor.close()
+    conn.close()
+    return {"message": "Account created", "account_id": account_id}
+
+@app.get("/accounts/{user_id}")
+async def get_accounts(user_id: str):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT account_id, account_name FROM accounts WHERE user_id = %s", (user_id,))
+    accounts = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    return [{"account_id": a[0], "account_name": a[1]} for a in accounts]
+
+@app.post("/assets")
+async def add_asset(asset: Asset):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("INSERT INTO assets (account_id, ticker_symbol, asset_class) VALUES (%s, %s, %s) RETURNING asset_id",
+                       (asset.account_id, asset.ticker_symbol, asset.asset_class))
+        asset_id = cursor.fetchone()[0]
+        conn.commit()
+        return {"message": "Asset added", "asset_id": asset_id}
+    except psycopg2.IntegrityError:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail="Asset already exists in this account.")
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.delete("/assets/{asset_id}")
+async def delete_asset(asset_id: str):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM assets WHERE asset_id = %s", (asset_id,))
+    conn.commit()
+    cursor.close()
+    conn.close()
+    return {"message": "Asset and all associated transactions deleted."}
+
+# --- Transaction Endpoints ---
+@app.post("/transactions")
+async def log_transaction(transaction: Transaction):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Check for sufficient shares for a 'Sell' transaction
+    if transaction.transaction_type == 'Sell':
+        cursor.execute("""
+            SELECT SUM(shares) AS total_shares FROM transactions WHERE asset_id = %s AND transaction_type = 'Buy'
+        """, (transaction.asset_id,))
+        buys = cursor.fetchone()[0] or 0.0
+        
+        cursor.execute("""
+            SELECT SUM(shares) AS total_shares FROM transactions WHERE asset_id = %s AND transaction_type = 'Sell'
+        """, (transaction.asset_id,))
+        sells = cursor.fetchone()[0] or 0.0
+        
+        current_shares = buys - sells
+        if transaction.shares > current_shares:
+            conn.close()
+            raise HTTPException(status_code=400, detail="Not enough shares to sell.")
+            
+    cursor.execute("INSERT INTO transactions (asset_id, transaction_type, transaction_date, shares, price_per_share, amount) VALUES (%s, %s, %s, %s, %s, %s) RETURNING transaction_id",
+                   (transaction.asset_id, transaction.transaction_type, transaction.transaction_date, transaction.shares, transaction.price_per_share, transaction.amount))
+    transaction_id = cursor.fetchone()[0]
+    conn.commit()
+    cursor.close()
+    conn.close()
+    return {"message": "Transaction logged", "transaction_id": transaction_id}
+
+@app.get("/transactions/{asset_id}")
+async def get_asset_transactions(asset_id: str):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT transaction_type, transaction_date, shares, price_per_share, amount FROM transactions WHERE asset_id = %s ORDER BY transaction_date", (asset_id,))
+    transactions = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    return [{"type": t[0], "date": t[1], "shares": t[2], "price": t[3], "amount": t[4]} for t in transactions]
+
+# --- Portfolio Endpoints ---
+@app.get("/portfolio/{user_id}")
+async def get_portfolio_summary(user_id: str):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        SELECT a.asset_id, a.ticker_symbol, a.asset_class
+        FROM assets a
+        JOIN accounts acc ON a.account_id = acc.account_id
+        WHERE acc.user_id = %s
+    """, (user_id,))
+    assets_in_portfolio = cursor.fetchall()
+    
+    portfolio_value = 0
+    total_cost_basis = 0
+    holdings = []
+    
+    for asset_id, ticker, asset_class in assets_in_portfolio:
+        cursor.execute("""
+            SELECT SUM(CASE WHEN transaction_type = 'Buy' THEN shares ELSE -shares END) AS total_shares,
+                   SUM(CASE WHEN transaction_type = 'Buy' THEN amount ELSE -amount END) AS total_cost
+            FROM transactions
+            WHERE asset_id = %s
+        """, (asset_id,))
+        shares_data = cursor.fetchone()
+        
+        current_shares = shares_data[0] or 0.0
+        current_cost_basis = shares_data[1] or 0.0
+        
+        if current_shares > 0:
+            current_price = get_current_price_mock(ticker)
+            current_value = current_price * current_shares
+            gain_loss = current_value - current_cost_basis
+            
+            portfolio_value += current_value
+            total_cost_basis += current_cost_basis
+            
+            holdings.append({
+                "asset_id": asset_id,
+                "ticker": ticker,
+                "shares": current_shares,
+                "cost_basis": current_cost_basis,
+                "current_value": current_value,
+                "gain_loss": gain_loss,
+                "asset_class": asset_class
+            })
+    
+    cursor.close()
+    conn.close()
+    
+    total_gain_loss = portfolio_value - total_cost_basis
+    
+    return {
+        "total_value": portfolio_value,
+        "total_gain_loss": total_gain_loss,
+        "holdings": holdings
+    }
