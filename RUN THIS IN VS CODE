@@ -1,0 +1,7 @@
+pip install streamlit fastapi "uvicorn[standard]" psycopg2-binary requests plotly
+
+
+uvicorn BACKEND_PF:app --reload
+
+
+streamlit run FRONTEND_PF.py
